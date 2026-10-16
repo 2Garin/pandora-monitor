@@ -14,6 +14,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger('pandora-monitor')
 
 
+def suppress_pandora_network_traceback(record):
+    # pandora-cas logs these expected outages with exc_info before reraising.
+    # Our cycle logs a short warning and reports the outage to Kuma instead.
+    return not (record.exc_info and isinstance(record.exc_info[1], (TimeoutError, aiohttp.ClientConnectionError)))
+
+
+pandora_log = logging.getLogger('pandora-monitor.pandora')
+pandora_log.addFilter(suppress_pandora_network_traceback)
+
+
 def required(name):
     value = os.getenv(name)
     if not value:
@@ -61,7 +71,7 @@ async def run_once(session):
     api_token = required('KUMA_PUSH_API')
     stage = 'reading Pandora state'
     try:
-        account = PandoraOnlineAccount(session=session, username=required('PANDORA_LOGIN'), password=required('PANDORA_PASSWORD'))
+        account = PandoraOnlineAccount(session=session, username=required('PANDORA_LOGIN'), password=required('PANDORA_PASSWORD'), logger=pandora_log)
         await account.async_authenticate()
         await account.async_refresh_devices()
         await account.async_request_updates()
@@ -106,12 +116,17 @@ async def run_once(session):
         await push(session, base, api_token, 'up', 'Pandora API and Kuma push OK')
         log.info('Voltage=%s V; last contact %.1fh ago; connection=%s; battery=%s', voltage, age_hours, 'up' if connection_ok else 'down', battery_status)
     except Exception as exc:
-        # HTTP exceptions can contain the push token in their URL; do not log them verbatim.
-        detail = (str(exc) if stage == 'saving battery history' and isinstance(exc, (sqlite3.Error, RuntimeError))
-                  else type(exc).__name__)
-        log.error('Monitoring cycle failed while %s: %s', stage, detail)
+        if stage == 'reading Pandora state' and isinstance(exc, (TimeoutError, aiohttp.ClientConnectionError)):
+            log.warning('Pandora API unavailable: %s', type(exc).__name__)
+            message = 'Pandora API unavailable: connection timeout' if isinstance(exc, TimeoutError) else 'Pandora API unavailable: connection error'
+        else:
+            # HTTP exceptions can contain the push token in their URL; do not log them verbatim.
+            detail = (str(exc) if stage == 'saving battery history' and isinstance(exc, (sqlite3.Error, RuntimeError))
+                      else type(exc).__name__)
+            log.error('Monitoring cycle failed while %s: %s', stage, detail)
+            message = f'Monitor error: {type(exc).__name__}'
         try:
-            await push(session, base, api_token, 'down', f'Monitor error: {type(exc).__name__}')
+            await push(session, base, api_token, 'down', message)
         except Exception:
             log.error('Unable to report API monitor failure to Kuma')
 
